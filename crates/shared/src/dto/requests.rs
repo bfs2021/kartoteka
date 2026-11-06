@@ -1,37 +1,5 @@
 use crate::deserializers::{default_config, double_option};
-use crate::models::{ContainerStatus, ListFeature};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateContainerRequest {
-    pub name: String,
-    pub status: Option<ContainerStatus>,
-    pub parent_container_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateContainerRequest {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "double_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub description: Option<Option<String>>,
-    #[serde(
-        default,
-        deserialize_with = "double_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub status: Option<Option<ContainerStatus>>,
-    #[serde(
-        default,
-        deserialize_with = "double_option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub location_id: Option<Option<String>>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveListRequest {
@@ -58,11 +26,6 @@ impl SetListPlacementRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoveContainerRequest {
-    pub parent_container_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReorderContainersRequest {
     pub container_ids: Vec<String>,
     pub parent_container_id: Option<String>,
@@ -72,24 +35,6 @@ impl ReorderContainersRequest {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.container_ids.is_empty() {
             return Err("container_ids must not be empty");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateListRequest {
-    pub name: String,
-    pub list_type: String,
-    pub features: Option<Vec<ListFeature>>,
-    pub parent_list_id: Option<String>,
-    pub container_id: Option<String>,
-}
-
-impl CreateListRequest {
-    pub fn validate_placement(&self) -> Result<(), &'static str> {
-        if self.parent_list_id.is_some() && self.container_id.is_some() {
-            return Err("parent_list_id and container_id are mutually exclusive");
         }
         Ok(())
     }
