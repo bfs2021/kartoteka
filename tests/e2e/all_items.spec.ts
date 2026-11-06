@@ -49,7 +49,7 @@ test("all items page shows empty state with no items", async ({ page, context })
   await setup(page, context);
   await page.goto("/all");
   await page.waitForSelector("[data-hydrated]");
-  await expect(page.locator('text=Brak elementów')).toBeVisible();
+  await expect(page.locator('text=No items.')).toBeVisible();
 });
 
 // ── Displays items ────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ test("all completed + hide filter shows helpful message", async ({ page, context
   await expect(page.locator('[data-testid="all-completion-count"]')).toContainText("1/1");
 
   await page.locator('[data-testid="hide-completed-toggle"]').click();
-  await expect(page.locator('text=Wszystkie elementy ukończone')).toBeVisible();
+  await expect(page.locator('text=All items completed')).toBeVisible();
 });
 
 // ── Item link navigates to detail ─────────────────────────────────────────────
