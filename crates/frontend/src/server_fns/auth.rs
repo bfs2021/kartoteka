@@ -10,9 +10,9 @@ use {
         SESSION_MAX_2FA_ATTEMPTS, SESSION_PENDING_2FA_ATTEMPTS_KEY, SESSION_PENDING_USER_KEY,
         SESSION_RETURN_TO_KEY,
     },
+    kartoteka_shared::safe_return_to,
     sqlx::SqlitePool,
     tower_sessions::Session,
-    urlencoding,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -68,9 +68,10 @@ pub async fn do_login(
             .insert(SESSION_PENDING_USER_KEY, &user.id)
             .await
             .map_err(|e| ServerFnError::new(e.to_string()))?;
-        if let Some(ref rt) = return_to {
-            if rt.starts_with('/') && !rt.starts_with("//") {
-                let _ = session.insert(SESSION_RETURN_TO_KEY, rt).await;
+        if let Some(rt) = return_to.as_deref() {
+            let safe = safe_return_to(rt);
+            if safe != "/" {
+                let _ = session.insert(SESSION_RETURN_TO_KEY, safe).await;
             }
         }
         return Ok(LoginOutcome::TwoFaRequired);
@@ -80,10 +81,8 @@ pub async fn do_login(
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let redirect_to = return_to
-        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
-        .unwrap_or_else(|| "/".to_string());
-    leptos_axum::redirect(&redirect_to);
+    let redirect_to = return_to.as_deref().map_or("/", safe_return_to);
+    leptos_axum::redirect(redirect_to);
     Ok(LoginOutcome::Ok)
 }
 
@@ -146,10 +145,8 @@ pub async fn do_verify_2fa(code: String) -> Result<(), ServerFnError> {
         .await
         .map_err(|e| ServerFnError::new(e.to_string()))?;
 
-    let redirect_to = return_to
-        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
-        .unwrap_or_else(|| "/".to_string());
-    leptos_axum::redirect(&redirect_to);
+    let redirect_to = return_to.as_deref().map_or("/", safe_return_to);
+    leptos_axum::redirect(redirect_to);
     Ok(())
 }
 
@@ -206,27 +203,4 @@ pub async fn get_auth_status() -> Result<bool, ServerFnError> {
         .await
         .map_err(|_| ServerFnError::new("auth extraction failed".to_string()))?;
     Ok(auth.user.is_some())
-}
-
-/// Checks auth and issues a server-side redirect to /login?return_to=<path> if not
-/// authenticated. During SSR the redirect header is set before any HTML is sent.
-#[server(prefix = "/leptos")]
-pub async fn require_auth(return_to: String) -> Result<(), ServerFnError> {
-    let auth = leptos_axum::extract::<AuthSession<KartotekaBackend>>()
-        .await
-        .map_err(|_| ServerFnError::new("auth extraction failed".to_string()))?;
-    if auth.user.is_none() {
-        let safe = if return_to.starts_with('/')
-            && !return_to.starts_with("//")
-            && !return_to.contains('\\')
-            && !return_to.contains(['\r', '\n', '\t'])
-        {
-            return_to
-        } else {
-            "/".to_string()
-        };
-        leptos_axum::redirect(&format!("/login?return_to={}", urlencoding::encode(&safe)));
-        return Err(ServerFnError::new("unauthorized".to_string()));
-    }
-    Ok(())
 }

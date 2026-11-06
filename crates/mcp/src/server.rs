@@ -195,6 +195,33 @@ impl KartotekaServer {
         }
         Ok(())
     }
+
+    /// Verify every id in `ids` belongs to `uid`. `kind_label` appears in the
+    /// error message so callers can distinguish list references.
+    async fn ensure_lists_owned(
+        &self,
+        uid: &str,
+        ids: &[&str],
+        kind_label: &str,
+        locale: &str,
+    ) -> Result<(), ErrorData> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut unique: Vec<&str> = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let owned = db::lists::find_owned_ids(&self.pool, uid, &unique)
+            .await
+            .map_err(self.db_err(locale))?;
+        if unique.iter().any(|id| !owned.contains(*id)) {
+            return Err(self.map_err(
+                McpError::BadRequest(format!("one or more {kind_label} values not found")),
+                locale,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[tool_router]
@@ -467,11 +494,7 @@ impl KartotekaServer {
             .await
             .map_err(self.domain_err(&locale))?;
         let limit = domain::paging::clamp_limit(p.limit);
-        let offset: usize = p
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
+        let offset = decode_cursor(p.cursor.as_deref());
         let page: Vec<_> = all
             .iter()
             .skip(offset)
@@ -480,7 +503,7 @@ impl KartotekaServer {
             .map(|i| localize_item(i, &tz))
             .collect();
         let next_cursor = if offset + page.len() < all.len() {
-            Some((offset + page.len()).to_string())
+            Some(encode_cursor(offset + page.len()))
         } else {
             None
         };
@@ -507,11 +530,7 @@ impl KartotekaServer {
         let tz = Self::timezone(&parts);
         tracing::debug!(container_id = %p.container_id, recursive = p.recursive.unwrap_or(false));
         let limit = domain::paging::clamp_limit(p.limit);
-        let offset: usize = p
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
+        let offset = decode_cursor(p.cursor.as_deref());
         let recursive = p.recursive.unwrap_or(false);
         let mut rows = domain::items::list_for_container(
             &self.pool,
@@ -525,7 +544,7 @@ impl KartotekaServer {
         .map_err(self.domain_err(&locale))?;
         let next_cursor = if rows.len() > limit as usize {
             rows.truncate(limit as usize);
-            Some((offset + limit as usize).to_string())
+            Some(encode_cursor(offset + limit as usize))
         } else {
             None
         };
@@ -1021,6 +1040,16 @@ impl KartotekaServer {
         self.ensure_containers_owned(&uid, &container_ids, "container_id", &locale)
             .await?;
 
+        // Literal parent_list_id values must belong to the caller. Parent refs
+        // resolved within this batch point at rows created by this same user.
+        let parent_list_ids: Vec<&str> = p
+            .lists
+            .iter()
+            .filter_map(|l| l.parent_list_id.as_deref())
+            .collect();
+        self.ensure_lists_owned(&uid, &parent_list_ids, "parent_list_id", &locale)
+            .await?;
+
         // Pre-fetch next_position per (container_id, parent_list_id) scope so
         // batch creates don't collide with existing rows. Entries that resolve
         // their parent via *_ref point at brand-new rows whose default base 0
@@ -1485,6 +1514,36 @@ fn today_in_tz(tz_str: &str) -> String {
         .to_string()
 }
 
+/// Encode a pagination offset as an opaque cursor.
+///
+/// The cursor is `URL_SAFE_NO_PAD` base64 of `o:<offset>`, so clients must not
+/// interpret or construct it themselves; they only echo it back.
+fn encode_cursor(offset: usize) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("o:{offset}"))
+}
+
+/// Decode a cursor produced by [`encode_cursor`], falling back to offset 0.
+///
+/// Anything that is not one of our own cursors (absent, invalid base64, invalid
+/// UTF-8, missing `o:` prefix, non-numeric payload) is treated as "start over".
+fn decode_cursor(cursor: Option<&str>) -> usize {
+    use base64::Engine as _;
+    let Some(cursor) = cursor else {
+        return 0;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor) else {
+        return 0;
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return 0;
+    };
+    let Some(rest) = text.strip_prefix("o:") else {
+        return 0;
+    };
+    rest.parse().unwrap_or(0)
+}
+
 fn localize_item(mut item: domain::items::Item, tz: &str) -> domain::items::Item {
     item.created_at = kartoteka_shared::date_utils::format_datetime_in_tz(&item.created_at, tz);
     item.updated_at = kartoteka_shared::date_utils::format_datetime_in_tz(&item.updated_at, tz);
@@ -1571,6 +1630,33 @@ mod tests {
         .unwrap();
         tx.commit().await.unwrap();
         id
+    }
+
+    #[test]
+    fn cursor_round_trips_offsets() {
+        for offset in [0, 3, 100] {
+            assert_eq!(decode_cursor(Some(&encode_cursor(offset))), offset);
+        }
+    }
+
+    #[test]
+    fn decode_missing_cursor_starts_at_zero() {
+        assert_eq!(decode_cursor(None), 0);
+    }
+
+    #[test]
+    fn decode_legacy_plain_number_is_rejected() {
+        assert_eq!(decode_cursor(Some("3")), 0);
+    }
+
+    #[test]
+    fn decode_garbage_is_rejected() {
+        assert_eq!(decode_cursor(Some("!!!")), 0);
+    }
+
+    #[test]
+    fn encoded_cursor_is_opaque() {
+        assert!(!encode_cursor(100).contains("100"));
     }
 
     #[test]
@@ -1810,5 +1896,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count.0, 2);
+    }
+
+    fn single_list_params(name: &str, parent_list_id: Option<String>) -> CreateListsParams {
+        CreateListsParams {
+            lists: vec![CreateListsInput {
+                name: name.to_owned(),
+                list_type: None,
+                icon: None,
+                description: None,
+                features: None,
+                container_id: None,
+                container_ref: None,
+                parent_list_id,
+                parent_list_ref: None,
+                client_ref: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn create_lists_under_own_parent_list_ok() {
+        let pool = multi_conn_pool().await;
+        let uid = create_test_user(&pool).await;
+        let parent = insert_test_list(&pool, &uid).await;
+        let server = test_server(pool);
+
+        let result = server
+            .create_lists(
+                Extension(parts_for_user(&uid)),
+                Parameters(single_list_params("Child", Some(parent.clone()))),
+            )
+            .await
+            .unwrap();
+        let text = result
+            .content
+            .into_iter()
+            .find_map(|c| match c.raw {
+                rmcp::model::RawContent::Text(t) => Some(t.text),
+                _ => None,
+            })
+            .expect("text content");
+        let lists: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let child_id = lists[0]["id"].as_str().unwrap();
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT parent_list_id FROM lists WHERE id = ?")
+                .bind(child_id)
+                .fetch_one(&server.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0.as_deref(), Some(parent.as_str()));
+    }
+
+    #[tokio::test]
+    async fn create_lists_with_other_users_parent_list_is_rejected() {
+        let pool = multi_conn_pool().await;
+        let owner = create_test_user(&pool).await;
+        let intruder = create_test_user(&pool).await;
+        let foreign_parent = insert_test_list(&pool, &owner).await;
+        let server = test_server(pool);
+
+        let err = match server
+            .create_lists(
+                Extension(parts_for_user(&intruder)),
+                Parameters(single_list_params("Child", Some(foreign_parent))),
+            )
+            .await
+        {
+            Ok(_) => panic!("create_lists must reject a foreign parent_list_id"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("parent_list_id"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lists WHERE user_id = ?")
+            .bind(&intruder)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0);
     }
 }

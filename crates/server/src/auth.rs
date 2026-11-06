@@ -72,6 +72,7 @@ use kartoteka_shared::constants::{
     SESSION_MAX_2FA_ATTEMPTS, SESSION_PENDING_2FA_ATTEMPTS_KEY, SESSION_PENDING_USER_KEY,
     SESSION_RETURN_TO_KEY,
 };
+use kartoteka_shared::safe_return_to;
 
 /// Extract a bearer token from the Authorization header.
 fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
@@ -332,7 +333,11 @@ pub async fn verify_2fa(
     {
         tracing::warn!("failed to remove {SESSION_PENDING_2FA_ATTEMPTS_KEY} from session: {e}");
     }
-    let return_to: Option<String> = session.remove(SESSION_RETURN_TO_KEY).await.unwrap_or(None);
+    let return_to: Option<String> = session
+        .remove::<String>(SESSION_RETURN_TO_KEY)
+        .await
+        .unwrap_or(None)
+        .map(|rt| safe_return_to(&rt).to_owned());
 
     if let Err(e) = auth_session.login(&user).await {
         tracing::error!("session write failed during 2fa login: {e}");
@@ -378,13 +383,17 @@ pub async fn totp_verify_setup(
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
 
-/// DELETE /auth/totp (authenticated)
+/// DELETE /auth/totp (authenticated) — body: {"code": "123456"}
 #[tracing::instrument(skip_all, fields(action = "totp_delete"))]
 pub async fn totp_delete(
     auth_session: AuthSession,
     State(state): State<AppState>,
+    Json(req): Json<TotpCodeRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let user = auth_session.user.ok_or(AppError::Unauthorized)?;
+    if !kartoteka_domain::auth::check_totp_code(&state.pool, &user.id, &req.code).await? {
+        return Err(AppError::Validation("invalid_totp_code".into()));
+    }
     kartoteka_domain::auth::disable_totp(&state.pool, &user.id).await?;
     Ok(Json(serde_json::json!({"status": "ok"})))
 }
